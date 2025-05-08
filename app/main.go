@@ -2,6 +2,8 @@ package main
 
 import (
 	"bufio"
+	"bytes"
+	"compress/gzip"
 	"errors"
 	"fmt"
 	"io"
@@ -32,6 +34,10 @@ type Response struct {
 	headers      map[string]string
 	responseBody string
 }
+
+const payLoadSizeError string = " 413 Payload too large\r\nContent-Length: 21\r\nContent-Type: text/plain\r\n\r\n413 Content Too Large"
+const badRequestMalformed string = " 400 Bad Request: Malformed Request Error\r\nContent-Length: 34\r\nContent-Type: text/plain\r\n\r\n400 Bad Request: Malformed Request\r\n"
+const serverError string = " 500 Internal Server Error\r\nContent-Length: 16\r\nContent-Type: text/plain\r\n\r\n500 Server Error\r\n"
 
 func main() {
 	args := os.Args
@@ -64,36 +70,73 @@ func main() {
 }
 
 func handleConnection(conn net.Conn, directory string) {
-	defer conn.Close()
-	reader := bufio.NewReader(conn)
-	requestParsedRef, err := parseHttp(reader)
-	if err != nil {
-		// malformed request: writing error to client
-		_, err = conn.Write([]byte(err.Error()))
+	for {
+		defer conn.Close()
+		reader := bufio.NewReader(conn)
+		requestParsedRef, err := parseHttp(reader)
+		// all parsing errors return a nil requestParsedRef and an http error message in err
+		// in the future keep a map that counts the number of times we get a parsing error from a
+		// likely attack and revoke connection and blacklist connections from that IP after a thresh
 		if err != nil {
-			fmt.Println("Error writing bytes to client connection (Error): " + err.Error())
+			// malformed request: writing error to client
+			_, err = conn.Write([]byte(err.Error()))
+			if err != nil {
+				log.Println("Error writing bytes to client connection (Error): " + err.Error())
+				return
+			}
+			// return here so we dont dereference a null requestParsedRef pointer
 			return
 		}
-		// return here so we dont dereference a null requestParsedRef pointer
-		return
-	}
-	fmt.Println(requestParsedRef.requestLine)
-	response, err := createResponse(requestParsedRef, directory)
-	if err != nil {
-		// invalid endpoint
-		fmt.Println("Error creating response to request: " + err.Error())
-	}
-	responseString := buildResponseString(response)
-	log.Println("Response String:\r\n" + responseString)
-	_, err = conn.Write([]byte(responseString))
-	if err != nil {
-		fmt.Println("Error writing responseString to client connection: " + err.Error())
+		fmt.Println(requestParsedRef.requestLine)
+		response, err := createResponse(requestParsedRef, directory)
+		if err != nil {
+			// the only time we have a non-nil error is when the endpoint is invalid
+			log.Println("Error creating response to request: " + err.Error())
+		}
+		// otherwise errors from creating a response are encoded in the response variable
+		// as a valid http string and simply sent to the client
+		responseString, dontKeepAlive := buildResponseString(response)
+		log.Println("Response String:\r\n" + responseString)
+		_, err = conn.Write([]byte(responseString))
+		if err != nil {
+			fmt.Println("Error writing responseString to client connection: " + err.Error())
+		}
+		if dontKeepAlive {
+			break
+		}
+
 	}
 	return
 }
-func buildResponseString(response *Response) string {
+func compressBodyGzip(response *Response) (bytes.Buffer, error) {
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	// writes a compressed form of response.responseBody to the underlying buf
+	_, err := zw.Write([]byte(response.responseBody))
+	if err != nil {
+		log.Println("Error compressing response body: " + err.Error())
+		return buf, errors.New(strings.Split(response.statusLine, " ")[0] + serverError)
+	}
+	if err := zw.Close(); err != nil {
+		log.Fatal(err)
+	}
+	return buf, nil
+}
+func buildResponseString(response *Response) (string, bool) {
 	var responseString string
+	var dontKeepAlive bool = false
 	responseString += response.statusLine
+	if response.headers["Content-Encoding"] == "gzip" {
+		// encode body and set content-length to length of encoded body
+		compressedBytesBuffer, err := compressBodyGzip(response)
+		if err != nil {
+			responseString = err.Error()
+			dontKeepAlive = true
+			return responseString, dontKeepAlive
+		}
+		response.responseBody = compressedBytesBuffer.String()
+		response.headers["Content-Length"] = fmt.Sprintf("%d", len(response.responseBody))
+	}
 	if response.headers != nil {
 		for key, value := range response.headers {
 			responseString += key
@@ -104,15 +147,27 @@ func buildResponseString(response *Response) string {
 	}
 	responseString += "\r\n"
 	responseString += response.responseBody
-	return responseString
+	if strings.Contains(responseString, "Connection: close") {
+		dontKeepAlive = true
+	}
+	if strings.Contains(responseString, "500 Server Error") {
+		dontKeepAlive = true
+	}
+	return responseString, dontKeepAlive
 }
 func createResponse(requestParsed *Request, directory string) (*Response, error) {
 	response := Response{}
+	response.headers = make(map[string]string)
 	response.statusLine = requestParsed.httpVersion + " 200 OK\r\n"
+	if requestParsed.headers["Connection"] == "close" {
+		response.headers["Connection"] = "close"
+	}
+	if strings.Contains(requestParsed.headers["Accept-Encoding"], "gzip") {
+		response.headers["Content-Encoding"] = "gzip"
+	}
 	if requestParsed.urlPath == "/" {
 		return &response, nil
 	} else if strings.HasPrefix(requestParsed.urlPath, "/echo/") {
-		response.headers = make(map[string]string)
 		stringEcho := strings.Split(requestParsed.urlPath, "/echo/")[1]
 
 		response.headers["Content-Type"] = "text/plain"
@@ -121,7 +176,6 @@ func createResponse(requestParsed *Request, directory string) (*Response, error)
 		return &response, nil
 
 	} else if strings.HasPrefix(requestParsed.urlPath, "/user-agent") {
-		response.headers = make(map[string]string)
 		userAgent := requestParsed.headers["User-Agent"]
 		response.headers["Content-Type"] = "text/plain"
 		response.headers["Content-Length"] = fmt.Sprintf("%d", len(userAgent))
@@ -129,24 +183,10 @@ func createResponse(requestParsed *Request, directory string) (*Response, error)
 		return &response, nil
 
 	} else if strings.HasPrefix(requestParsed.urlPath, "/files/") {
+
 		fileName := strings.Split(requestParsed.urlPath, "/files/")[1]
 		fullFilePath := filepath.Join(directory, fileName)
-		/*
-			unescapedPath, err := url.PathUnescape(fullFilePath)
-			if err != nil {
-				log.Println("Error processing /files/ endpoint: Error unescaping path - " + fullFilePath)
-				response.statusLine = requestParsed.httpVersion + " 404 Not Found\r\n"
-				return &response, nil
-			}
-			cleanedPath := filepath.Clean(unescapedPath) // resolve .., ., and separator elements to their meanings in the file system
-			if !strings.HasPrefix(cleanedPath, directory) {
-				log.Println("Error processing /files/ endpoint: User submitted filepath outside of root directory: " + unescapedPath)
-				response.statusLine = requestParsed.httpVersion + " 404 Not Found\r\n"
-				return &response, nil
-			}
-		*/
 		if requestParsed.requestMethod == "GET" {
-			response.headers = make(map[string]string)
 			fmt.Println("GET Request to Files Endpoint")
 			data, err := os.ReadFile(fullFilePath)
 			if err != nil {
@@ -170,6 +210,7 @@ func createResponse(requestParsed *Request, directory string) (*Response, error)
 			return &response, nil
 
 		} else if requestParsed.requestMethod == "POST" {
+			fmt.Println("POST request received to files endpoint")
 			numBytesToRead, err := strconv.Atoi(requestParsed.headers["Content-Length"])
 			if err != nil {
 				log.Println("Error reading content-length from header: " + err.Error())
@@ -194,7 +235,8 @@ func createResponse(requestParsed *Request, directory string) (*Response, error)
 				response.responseBody = "500 Internal Server Error\n"
 				return &response, nil
 			}
-			err = os.WriteFile(directory+fileName, fileBuffer, 0777)
+			err = os.WriteFile(fullFilePath, fileBuffer, 0777)
+			fmt.Println("Writing file: " + fullFilePath)
 			if err != nil {
 				log.Println("Error writing file: " + directory + fileName + " - " + err.Error())
 				response.statusLine = requestParsed.httpVersion + " 500 Internal Server Error\r\n"
@@ -232,8 +274,9 @@ func parseHttp(reader *bufio.Reader) (*Request, error) {
 	request.requestLine = requestLine
 	requestLineParts := strings.Split(requestLine, " ")
 	if len(requestLineParts) != 3 {
-		return nil, errors.New("HTTP/1.1 400 Bad Request: Malformed Request Error\r\nContent-Length: 34\r\nContent-Type: text/plain\r\n\r\n400 Bad Request: Malformed Request\r\n")
+		return nil, errors.New("HTTP/1.1" + badRequestMalformed)
 	}
+
 	request.requestMethod = strings.Trim(requestLineParts[0], " \r\n")
 	request.urlPath = strings.Trim(requestLineParts[1], " \r\n")
 	request.httpVersion = strings.Trim(requestLineParts[2], " \r\n")
@@ -245,7 +288,7 @@ func parseHttp(reader *bufio.Reader) (*Request, error) {
 	fmt.Println("Headers")
 	validRequestLine := requestLineValidation(&request)
 	if !validRequestLine {
-		return nil, errors.New("HTTP/1.1 400 Bad Request: Malformed Request Error\r\nContent-Length: 34\r\nContent-Type: text/plain\r\n\r\n400 Bad Request: Malformed Request\r\n")
+		return nil, errors.New("HTTP/1.1" + badRequestMalformed)
 	}
 
 	request.headers = make(map[string]string)
@@ -254,8 +297,6 @@ func parseHttp(reader *bufio.Reader) (*Request, error) {
 	// catch duplicate content-length Headers
 	seenContentLength := false
 
-	limited := &io.LimitedReader{R: reader, N: maxHeaderLineLength}
-	limitedReader := bufio.NewReader(limited)
 	for {
 		if headerCount > maxNumHeaders || totalHeaderSize > totalHeaderSizeLimit {
 			log.Println("Possible attack vector:")
@@ -264,19 +305,17 @@ func parseHttp(reader *bufio.Reader) (*Request, error) {
 			} else {
 				log.Println("Total size of header section - " + strconv.Itoa(totalHeaderSize) + " - exceeds header size limit - " + strconv.Itoa(totalHeaderSizeLimit))
 			}
-			return nil, errors.New("HTTP/1.1 400 Bad Request: Malformed Request Error\r\nContent-Length: 34\r\nContent-Type: text/plain\r\n\r\n400 Bad Request: Malformed Request\r\n")
+			return nil, errors.New(request.httpVersion + badRequestMalformed)
 		}
 		// stop reading after we have read 512 bytes in a single line and return an error
-		headerLine, err := limitedReader.ReadString('\n')
+		headerLine, err := readLimitedLine(reader, maxHeaderLineLength)
 		if err != nil {
-			if err == io.EOF && !strings.HasSuffix(headerLine, "\n") {
-				log.Println("Header line too long (truncated):", len(headerLine), "bytes")
-
-			}
-			log.Println("Error reading headerLine: " + err.Error())
-			return nil, errors.New(request.httpVersion + " 400 Bad Request: Malformed Request Error\r\nContent-Length: 34\r\nContent-Type: text/plain\r\n\r\n400 Bad Request: Malformed Request\r\n")
+			return nil, errors.New(request.httpVersion + serverError)
 		}
-		fmt.Println("Header Line: " + headerLine)
+		if headerLine == "" {
+			return nil, errors.New(request.httpVersion + badRequestMalformed)
+		}
+		fmt.Println(headerLine)
 		if headerLine == "\r\n" || headerLine == "\n" {
 			break
 		}
@@ -284,24 +323,24 @@ func parseHttp(reader *bufio.Reader) (*Request, error) {
 		headerLine = strings.Trim(headerLine, "\r\n ")
 		if !validPrintableAsciiHeader(headerLine) {
 			log.Println("Error reading headerLine: Not Valid Printable ASCII")
-			return nil, errors.New(request.httpVersion + " 400 Bad Request: Malformed Request Error\r\nContent-Length: 15\r\nContent-Type: text/plain\r\n\r\n400 Bad Request\r\n")
+			return nil, errors.New(request.httpVersion + badRequestMalformed)
 		}
 		headerLineParts := strings.Split(headerLine, ":")
 		if len(headerLineParts) != 2 || headerLineParts[0] == "" || headerLineParts[1] == "" {
 			if headerLineParts[0] != "Host" {
 				// if line in header is not of the form key: value where both key and value are non-empty
 				log.Println("Malformed header line: " + headerLine)
-				return nil, errors.New(request.httpVersion + " 400 Bad Request: Malformed Request Error\r\nContent-Length: 15\r\nContent-Type: text/plain\r\n\r\n400 Bad Request\r\n")
+				return nil, errors.New(request.httpVersion + badRequestMalformed)
 			}
 		}
 		key := strings.Trim(headerLineParts[0], " ")
-		val := strings.Join(headerLineParts[1:], ":")
-		val = strings.TrimSpace(val)
+		valJoined := strings.Join(headerLineParts[1:], ":")
+		val := strings.TrimSpace(valJoined)
 
 		if key == "Content-Length" {
 			if seenContentLength {
 				log.Println("Possible attack vector - Duplicated Content-Length header")
-				return nil, errors.New(request.httpVersion + " 400 Bad Request: Malformed Request Error\r\nContent-Length: 15\r\nContent-Type: text/plain\r\n\r\n400 Bad Request\r\n")
+				return nil, errors.New(request.httpVersion + badRequestMalformed)
 			} else {
 				seenContentLength = true
 			}
@@ -315,7 +354,7 @@ func parseHttp(reader *bufio.Reader) (*Request, error) {
 	if request.headers["Host"] == "" {
 		// Host missing from headers
 		log.Println("Malformed header section: Missing required Host header")
-		return nil, errors.New(request.httpVersion + " 400 Bad Request: Malformed Request Error\r\nContent-Length: 15\r\nContent-Type: text/plain\r\n\r\n400 Bad Request\r\n")
+		return nil, errors.New(request.httpVersion + badRequestMalformed)
 	}
 	if request.requestMethod == "POST" {
 		contentLengthStr := request.headers["Content-Length"]
@@ -324,21 +363,22 @@ func parseHttp(reader *bufio.Reader) (*Request, error) {
 			contentLength, err := strconv.Atoi(contentLengthStr)
 			if err != nil {
 				log.Println("Error converting contentLength to int while parsing request: " + err.Error())
-				return nil, errors.New(request.httpVersion + " 500 Internal Server Error\r\nContent-Length: 16\r\nContent-Type: text/plain\r\n\r\n500 Server Error\r\n")
+				return nil, errors.New(request.httpVersion + serverError)
 			}
 			if contentLength > maxAllowedBodySize {
 				log.Println("Content-Length - " + strconv.Itoa(contentLength) + " - exceeds maximum allowed body size - " + strconv.Itoa(maxAllowedBodySize))
-				return nil, errors.New(request.httpVersion + " 413 Payload too large\r\nContent-Length: 21\r\nContent-Type: text/plain\r\n\r\n413 Content Too Large")
+				return nil, errors.New(request.httpVersion + payLoadSizeError)
 			}
 			bodyBytes := make([]byte, contentLength)
-			_, err = io.ReadFull(reader, bodyBytes)
+			n, err := io.ReadFull(reader, bodyBytes)
+			fmt.Println("Bytes read from body", n)
 			if err != nil {
 				log.Println("Error reading into buffer parsing request Body: " + err.Error())
-				return nil, errors.New(request.httpVersion + " 500 Internal Server Error\r\nContent-Length: 16\r\nContent-Type: text/plain\r\n\r\n500 Server Error\r\n")
+				return nil, errors.New(request.httpVersion + serverError)
 			}
 			request.body = string(bodyBytes)
 		} else {
-			return nil, errors.New(request.httpVersion + " 400 Bad Request: Malformed Request Error\r\nContent-Length: 34\r\nContent-Type: text/plain\r\n\r\n400 Bad Request: Malformed Request\r\n")
+			return nil, errors.New(request.httpVersion + badRequestMalformed)
 		}
 	}
 	// if the requst is a post or a put we might have a body - in which case we should read exactly
@@ -386,4 +426,28 @@ func validPrintableAsciiHeader(headerLine string) bool {
 		}
 	}
 	return true
+}
+func readLimitedLine(reader *bufio.Reader, maxLineLen int64) (string, error) {
+	limited := &io.LimitedReader{R: reader, N: maxLineLen}
+	var builder strings.Builder
+	buf := make([]byte, 1)
+
+	for {
+		n, err := limited.Read(buf)
+		if n > 0 {
+			builder.WriteByte(buf[0])
+			if buf[0] == '\n' {
+				break
+			}
+		}
+		if err != nil {
+			if err == io.EOF {
+				log.Println("Header line too long (truncated):", len(builder.String()), "bytes")
+				return "", nil
+			}
+			log.Println("Error reading headerLine: " + err.Error())
+			return "", err
+		}
+	}
+	return builder.String(), nil
 }
